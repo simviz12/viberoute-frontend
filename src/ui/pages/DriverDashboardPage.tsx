@@ -53,7 +53,8 @@ export const DriverDashboardPage: React.FC = () => {
         useRouteStore.getState().setRoute(null);
       }
 
-      const { data: myOrders } = await api.get('/orders/mine');
+      const res = await api.get('/orders/mine');
+      const myOrders = Array.isArray(res.data) ? res.data : (Array.isArray(res.data?.orders) ? res.data.orders : []);
 
       if (myOrders.length > 0) {
         setOrders(myOrders);
