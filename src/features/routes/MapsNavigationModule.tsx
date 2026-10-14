@@ -1,21 +1,17 @@
-import React, { useMemo, useState, useCallback, useRef, useEffect } from 'react';
-import { GoogleMap, useJsApiLoader, MarkerF, OverlayViewF, OverlayView } from '@react-google-maps/api';
-import { Loader2, Navigation, Clock, MapPin, Box, Target, Sun, Moon, Phone, User, X } from 'lucide-react';
+import React, { useMemo, useState, useRef, useEffect, useCallback } from 'react';
+import { Loader2, Navigation, Clock, MapPin, Box, Target, Sun, Moon, Phone, X, Truck, CheckCircle2 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 import api from '../../shared/lib/api';
 import { useMissionStore } from '../../app/store/missionStore';
 import { useRouteStore } from '../../app/store/routeStore';
+import { useWebSocket } from '../../infrastructure/websocket/useWebSocket';
 
-const containerStyle = { width: '100%', height: '100%' };
-const LIBRARIES: ("geometry" | "drawing" | "places" | "visualization")[] = ["geometry"];
-const COMPLETED_STATUSES = new Set(['DELIVERED', 'RETURNED', 'CANCELLED']);
-const GPS_ICON_SIZE = 24;
-const ROUTE_RECALC_INTERVAL_MS = 4500;
-const ROUTE_EATEN_THRESHOLD_METERS = 50;
-const PRIORITY_RANK: Record<string, number> = { HIGH: 3, MEDIUM: 2, LOW: 1 };
+declare const L: any;
 
-type MapStop = {
+interface MapStop {
   id?: number;
+  batchId?: number;
+  deliveryOrder?: number;
   lat: number;
   lng: number;
   status?: string;
@@ -25,709 +21,628 @@ type MapStop = {
   clientReference?: string;
   phone?: string;
   driverName?: string;
-};
+}
 
-const isActiveStop = (stop: { status?: string }) =>
-  !stop.status || !COMPLETED_STATUSES.has(stop.status);
-
-const normalizeStop = (o: Record<string, unknown>): MapStop => ({
-  ...(o as MapStop),
-  lat: Number(o.lat ?? o.latitude ?? (o.location as { lat?: number })?.lat),
-  lng: Number(o.lng ?? o.longitude ?? (o.location as { lng?: number })?.lng),
-});
-
-const orderStopsForStrategy = (stops: MapStop[], strategy: 'EFFICIENCY' | 'PRIORITY') => {
-  if (stops.length <= 1 || strategy !== 'PRIORITY') return stops;
-  const [activeStop, ...rest] = stops;
-  return [
-    activeStop,
-    ...rest.sort((a, b) => (PRIORITY_RANK[b.priority || ''] ?? 0) - (PRIORITY_RANK[a.priority || ''] ?? 0)),
-  ];
-};
+const COMPLETED_STATUSES = new Set(['DELIVERED', 'RETURNED', 'CANCELLED']);
+const PRIORITY_RANK: Record<string, number> = { HIGH: 3, MEDIUM: 2, LOW: 1 };
 
 export const MapsNavigationModule: React.FC = () => {
   const { currentBatchId, setActiveOrder } = useMissionStore();
   const route = useRouteStore((s) => s.route);
   const backupOrders = useRouteStore((s) => s.backupOrders);
   const driverPos = useRouteStore((s) => s.driverPos);
+  const fleetDrivers = useRouteStore((s) => s.fleetDrivers);
   const mapTheme = useRouteStore((s) => s.mapTheme);
   const setRoute = useRouteStore((s) => s.setRoute);
   const setDriverPos = useRouteStore((s) => s.setDriverPos);
   const setMapTheme = useRouteStore((s) => s.setMapTheme);
-  
-  // ESTADOS LOCALES PARA CONTROL TOTAL
+  const updateFleetDriver = useRouteStore((s) => s.updateFleetDriver);
+  const setFleetDrivers = useRouteStore((s) => s.setFleetDrivers);
+
+  const mapContainerRef = useRef<HTMLDivElement | null>(null);
+  const leafletMapRef = useRef<any>(null);
+  const tileLayerRef = useRef<any>(null);
+  const markersLayerRef = useRef<any>(null);
+  const fleetMarkersLayerRef = useRef<any>(null);
+  const routePolylineRef = useRef<any>(null);
+
+  const [mapReady, setMapReady] = useState(false);
   const [loading, setLoading] = useState(true);
   const [optimizing, setOptimizing] = useState(false);
   const [optMode, setOptMode] = useState<'EFFICIENCY' | 'PRIORITY'>('EFFICIENCY');
-  const [activePath, setActivePath] = useState<google.maps.LatLngLiteral[]>([]);
-  const [futurePath, setFuturePath] = useState<google.maps.LatLngLiteral[]>([]);
-  const [currentWaypoints, setCurrentWaypoints] = useState<MapStop[]>([]);
-  const [routeVersion, setRouteVersion] = useState(0);
-  const [etaInfo, setEtaInfo] = useState<{distance: string, duration: string} | null>(null);
-  
-  const activePolylineRef = useRef<google.maps.Polyline | null>(null);
-  const futurePolylineRef = useRef<google.maps.Polyline | null>(null);
-  
-  const [isFollowing, setIsFollowing] = useState(true);
   const [selectedOrder, setSelectedOrder] = useState<any>(null);
-  const [deviceHeading, setDeviceHeading] = useState(0);
-  
-  const mapRef = useRef<google.maps.Map | null>(null);
-  const lastRequestId = useRef<number>(0);
-  const prevActiveCount = useRef<number>(0);
-  const isMapDraggingRef = useRef(false);
-  const followPanFrameRef = useRef<number | null>(null);
-  const routeSyncTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const dynamicRouteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const lastDirectionsSyncRef = useRef(0);
-  const renderedRouteVersionRef = useRef(0);
-  const isMobile =
-    typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches;
+  const [selectedDriver, setSelectedDriver] = useState<any>(null);
+  const [isFollowing, setIsFollowing] = useState(true);
+  const [etaInfo, setEtaInfo] = useState<{ distance: string; duration: string } | null>(null);
 
-  // [FASE 1] DESCONEXIÓN DEL CENTRO REACTIVO: Calculamos el centro inicial una sola vez
-  const initialCenter = useMemo(() => driverPos || { lat: 1.2136, lng: -77.2811 }, []);
+  const isMobile = typeof window !== 'undefined' && window.matchMedia('(max-width: 768px)').matches;
 
-  const { isLoaded, loadError } = useJsApiLoader({
-    id: 'google-map-script',
-    googleMapsApiKey: import.meta.env.VITE_GOOGLE_MAPS_KEY || '',
-    libraries: LIBRARIES,
-    language: 'es',
+  // Escuchar por WebSockets el movimiento en tiempo real de TODA la flota
+  const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8080/api/v1';
+  const WS_URL = `${apiBase.replace('/api/v1', '')}/ws-alertas`;
+
+  useWebSocket({
+    url: WS_URL,
+    topic: '/topic/fleet/locations',
+    onMessage: (msg: any) => {
+      if (msg && msg.driverId && msg.lat && msg.lng) {
+        updateFleetDriver({
+          driverId: msg.driverId,
+          driverName: msg.driverName || `Conductor #${msg.driverId}`,
+          lat: Number(msg.lat),
+          lng: Number(msg.lng),
+          status: msg.status || 'AVAILABLE',
+          assignedCity: msg.assignedCity,
+        });
+      }
+    },
   });
 
-  const mapStyles = useMemo(() => [
-    { "featureType": "poi", "stylers": [{ "visibility": mapTheme === 'light' ? "on" : "off" }] },
-    { "featureType": "landscape", "stylers": [{ "color": mapTheme === 'light' ? "#f8fafc" : "#0a1a2a" }] },
-    { "featureType": "road", "stylers": [{ "color": mapTheme === 'light' ? "#ffffff" : "#162c44" }] },
-    { "featureType": "water", "stylers": [{ "color": mapTheme === 'light' ? "#cbd5e1" : "#050d14" }] }
-  ], [mapTheme]);
-
-  const clearRouteVisuals = useCallback(() => {
-    activePolylineRef.current?.setMap(null);
-    futurePolylineRef.current?.setMap(null);
-    activePolylineRef.current = null;
-    futurePolylineRef.current = null;
-    setActivePath([]);
-    setFuturePath([]);
-    setCurrentWaypoints([]);
-    setEtaInfo(null);
-    setRouteVersion((version) => version + 1);
-  }, []);
-
-  const buildRemainingDirections = useCallback((
-    stopsToRoute: MapStop[],
-    origin: google.maps.LatLngLiteral,
-    targetMode: 'EFFICIENCY' | 'PRIORITY',
-    showOptimizing = false
-  ) => {
-    if (!currentBatchId || !driverPos || !isLoaded) {
-      setLoading(false);
-      return;
-    }
-
-    const validStops = orderStopsForStrategy(stopsToRoute.filter(isActiveStop), targetMode);
-    const immediateStop = validStops[0] ?? null;
-    setActiveOrder(immediateStop?.id ?? null);
-    setCurrentWaypoints(validStops);
-
-    if (validStops.length === 0 || !immediateStop) {
-      clearRouteVisuals();
-      setOptimizing(false);
-      setLoading(false);
-      return;
-    }
-
-    const reqId = ++lastRequestId.current;
-    if (showOptimizing) setOptimizing(true);
-
-    const ds = new google.maps.DirectionsService();
-    const stopLocation = (stop: MapStop) => ({ lat: stop.lat, lng: stop.lng });
-    const pathFromLegs = (legs: google.maps.DirectionsLeg[]) =>
-      legs.flatMap((leg) => leg.steps.flatMap((step) => step.path.map((p) => ({ lat: p.lat(), lng: p.lng() }))));
-
-    const finish = () => {
-      if (reqId === lastRequestId.current) {
-        setOptimizing(false);
-        setLoading(false);
-      }
-    };
-
-    if (targetMode === 'EFFICIENCY' && validStops.length > 1) {
-      ds.route({
-        origin,
-        destination: stopLocation(immediateStop),
-        travelMode: google.maps.TravelMode.DRIVING,
-        optimizeWaypoints: false,
-      }, (firstRes, firstStatus) => {
-        if (reqId !== lastRequestId.current) return;
-        if (firstStatus !== 'OK' || !firstRes) {
-          finish();
-          return;
-        }
-
-        const firstLeg = firstRes.routes[0].legs[0];
-        setEtaInfo({ distance: firstLeg.distance?.text || '', duration: firstLeg.duration?.text || '' });
-        setActivePath(pathFromLegs([firstLeg]));
-        setRouteVersion((version) => version + 1);
-
-        const remaining = validStops.slice(1);
-        ds.route({
-          origin: stopLocation(immediateStop),
-          destination: stopLocation(remaining[remaining.length - 1]),
-          waypoints: remaining.slice(0, -1).map((stop) => ({ location: stopLocation(stop), stopover: true })),
-          travelMode: google.maps.TravelMode.DRIVING,
-          optimizeWaypoints: true,
-        }, (futureRes, futureStatus) => {
-          if (reqId === lastRequestId.current && futureStatus === 'OK' && futureRes) {
-            const intermediate = remaining.slice(0, -1);
-            const optimizedRemaining = [
-              ...futureRes.routes[0].waypoint_order.map((index) => intermediate[index]),
-              remaining[remaining.length - 1],
-            ].filter(Boolean);
-            setCurrentWaypoints([immediateStop, ...optimizedRemaining]);
-            setFuturePath(pathFromLegs(futureRes.routes[0].legs));
-            setRouteVersion((version) => version + 1);
-          }
-          finish();
-        });
-      });
-      return;
-    }
-
-    ds.route({
-      origin,
-      destination: stopLocation(validStops[validStops.length - 1]),
-      waypoints: validStops.slice(0, -1).map((stop) => ({ location: stopLocation(stop), stopover: true })),
-      travelMode: google.maps.TravelMode.DRIVING,
-      optimizeWaypoints: false,
-    }, (res, status) => {
-      if (reqId === lastRequestId.current && status === 'OK' && res) {
-        const firstLeg = res.routes[0].legs[0];
-        setEtaInfo({ distance: firstLeg.distance?.text || '', duration: firstLeg.duration?.text || '' });
-        setActivePath(pathFromLegs([firstLeg]));
-        setFuturePath(pathFromLegs(res.routes[0].legs.slice(1)));
-        setRouteVersion((version) => version + 1);
-      }
-      finish();
-    });
-  }, [clearRouteVisuals, currentBatchId, driverPos, isLoaded, setActiveOrder]);
-
-  // DECLARACIÓN DE CALLBACKS (ANTES DE EFECTOS)
-  const syncRoute = useCallback(async (targetMode: 'EFFICIENCY' | 'PRIORITY') => {
-    if (!currentBatchId || !driverPos || !isLoaded) {
-       setLoading(false);
-       return;
-    }
-
-    const reqId = ++lastRequestId.current;
-    setOptimizing(true);
-    
-    // LIMPIEZA ATÓMICA DE ESTADOS LOCALES
-    clearRouteVisuals();
-
-    try {
-      const { data: optRoute } = await api.post(`/batches/${currentBatchId}/optimize`, {
-        lat: driverPos.lat,
-        lng: driverPos.lng,
-        mode: targetMode,
-        strategy: targetMode
-      });
-
-      if (reqId !== lastRequestId.current) return;
-      
-      setRoute(optRoute);
-      lastDirectionsSyncRef.current = 0;
-      return;
-    } catch (e) {
-      console.error("Error Sync:", e);
-    } finally {
-      if (reqId === lastRequestId.current) {
-        setOptimizing(false);
-        setLoading(false);
-      }
-    }
-  }, [clearRouteVisuals, currentBatchId, driverPos, isLoaded, setRoute]);
-
-  const updateRouteStrategy = useCallback((strategy: 'EFFICIENCY' | 'PRIORITY') => {
-    if (routeSyncTimerRef.current) clearTimeout(routeSyncTimerRef.current);
-    if (dynamicRouteTimerRef.current) clearTimeout(dynamicRouteTimerRef.current);
-    lastDirectionsSyncRef.current = 0;
-    clearRouteVisuals();
-    setOptMode(strategy);
-    syncRoute(strategy);
-  }, [clearRouteVisuals, syncRoute]);
-
-  // INTEGRACIÓN DE GIROSCOPIO / BRÚJULA (DeviceOrientation API)
+  // Cargar estado inicial de la flota desde la base de datos y rastrear GPS continuo en vivo
   useEffect(() => {
-    const handleOrientation = (e: any) => {
-      // Prioridad a iOS (webkitCompassHeading)
-      if (e.webkitCompassHeading !== undefined) {
-        setDeviceHeading(e.webkitCompassHeading);
-      } 
-      // Estándar absoluto (Android/Chrome)
-      else if (e.absolute && e.alpha !== null) {
-        setDeviceHeading(360 - e.alpha);
-      }
-    };
-
-    window.addEventListener('deviceorientationabsolute', handleOrientation, true);
-    window.addEventListener('deviceorientation', handleOrientation, true);
-    
-    return () => {
-      window.removeEventListener('deviceorientationabsolute', handleOrientation);
-      window.removeEventListener('deviceorientation', handleOrientation);
-    };
-  }, []);
-
-  useEffect(() => {
-    const activeCount = backupOrders.filter((o) => isActiveStop(o)).length;
-
-    if (activeCount < prevActiveCount.current && activeCount > 0 && isLoaded) {
-      if (selectedOrder && !isActiveStop(selectedOrder)) {
-        setSelectedOrder(null);
-      }
-      if (routeSyncTimerRef.current) clearTimeout(routeSyncTimerRef.current);
-      routeSyncTimerRef.current = setTimeout(() => syncRoute(optMode), 700);
-    }
-    prevActiveCount.current = activeCount;
-    return () => {
-      if (routeSyncTimerRef.current) clearTimeout(routeSyncTimerRef.current);
-    };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [backupOrders, optMode, isLoaded]);
-
-  // Limpiar solo el estado LOCAL de ruta al montar.
-  useEffect(() => {
-    setActivePath([]);
-    setFuturePath([]);
-    setEtaInfo(null);
-    setRoute(null);
-  }, []);
-
-  // DISPARADORES DE SINCRONIZACIÓN
-  useEffect(() => {
-    if (!isLoaded) return;
-    if (currentBatchId && driverPos) {
-      syncRoute(optMode);
-    } else {
-      setLoading(false);
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [currentBatchId, !!driverPos, isLoaded]);
-
-  useEffect(() => {
-    if (!isFollowing || !mapRef.current || !driverPos || isMapDraggingRef.current) return;
-    if (followPanFrameRef.current) cancelAnimationFrame(followPanFrameRef.current);
-    followPanFrameRef.current = requestAnimationFrame(() => {
-      if (!isMapDraggingRef.current && mapRef.current && driverPos) {
-        mapRef.current.panTo(driverPos);
-      }
-    });
-    return () => {
-      if (followPanFrameRef.current) cancelAnimationFrame(followPanFrameRef.current);
-    };
-  }, [driverPos?.lat, driverPos?.lng, isFollowing]);
-
-  const lastGpsRef = useRef<{ lat: number; lng: number } | null>(null);
-
-  useEffect(() => {
-    if (!navigator.geolocation) return;
-    const wId = navigator.geolocation.watchPosition(
-      (p) => {
-        const np = { lat: p.coords.latitude, lng: p.coords.longitude };
-        const prev = lastGpsRef.current;
-        if (
-          prev &&
-          Math.abs(prev.lat - np.lat) < 0.00003 &&
-          Math.abs(prev.lng - np.lng) < 0.00003
-        ) {
-          return;
-        }
-        lastGpsRef.current = np;
-        setDriverPos(np);
-      },
-      null,
-      { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 }
-    );
-    return () => navigator.geolocation.clearWatch(wId);
-  }, [setDriverPos]);
-
-  useEffect(() => {
-    if (!driverPos || activePath.length < 2 || !google.maps.geometry?.spherical) return;
-
-    const userLatLng = new google.maps.LatLng(driverPos.lat, driverPos.lng);
-    let closestIndex = -1;
-    let closestDistance = Number.POSITIVE_INFINITY;
-
-    activePath.forEach((point, index) => {
-      const distance = google.maps.geometry.spherical.computeDistanceBetween(
-        userLatLng,
-        new google.maps.LatLng(point.lat, point.lng)
+    let watchId: number | null = null;
+    if (navigator.geolocation) {
+      // 1. Obtener posición inmediata
+      navigator.geolocation.getCurrentPosition(
+        (geo) => {
+          setDriverPos({ lat: geo.coords.latitude, lng: geo.coords.longitude });
+        },
+        () => {
+          if (!driverPos) setDriverPos({ lat: 1.2136, lng: -77.2811 });
+        },
+        { enableHighAccuracy: true, timeout: 5000 }
       );
-      if (distance < closestDistance) {
-        closestDistance = distance;
-        closestIndex = index;
-      }
-    });
 
-    if (closestIndex > 0 && closestDistance <= ROUTE_EATEN_THRESHOLD_METERS) {
-      setActivePath((prev) => prev.slice(closestIndex));
-    }
-  }, [activePath, driverPos?.lat, driverPos?.lng]);
-
-  useEffect(() => {
-    if (!mapRef.current) return;
-
-    if (renderedRouteVersionRef.current !== routeVersion) {
-      activePolylineRef.current?.setMap(null);
-      futurePolylineRef.current?.setMap(null);
-      activePolylineRef.current = null;
-      futurePolylineRef.current = null;
-      renderedRouteVersionRef.current = routeVersion;
+      // 2. Rastreo continuo en vivo mientras el conductor se desplaza por la ciudad
+      watchId = navigator.geolocation.watchPosition(
+        (geo) => {
+          const newPos = { lat: geo.coords.latitude, lng: geo.coords.longitude };
+          setDriverPos(newPos);
+        },
+        (err) => console.warn('Geolocation watch error:', err),
+        { enableHighAccuracy: true, maximumAge: 3000, timeout: 10000 }
+      );
+    } else if (!driverPos) {
+      setDriverPos({ lat: 1.2136, lng: -77.2811 });
     }
 
-    const upsertPolyline = (
-      ref: React.MutableRefObject<google.maps.Polyline | null>,
-      path: google.maps.LatLngLiteral[],
-      options: google.maps.PolylineOptions
-    ) => {
-      if (path.length === 0) {
-        ref.current?.setMap(null);
-        ref.current = null;
-        return;
-      }
-      if (!ref.current) {
-        ref.current = new google.maps.Polyline({ ...options, path, map: mapRef.current! });
-      } else {
-        ref.current.setPath(path);
-        ref.current.setOptions(options);
-        if (!ref.current.getMap()) ref.current.setMap(mapRef.current);
+    api.get('/drivers/fleet-status')
+      .then((res) => {
+        if (Array.isArray(res.data)) {
+          const valid = res.data
+            .filter((d: any) => d.location && d.location.lat && d.location.lng)
+            .map((d: any) => ({
+              driverId: d.id,
+              driverName: d.name,
+              lat: Number(d.location.lat),
+              lng: Number(d.location.lng),
+              status: d.status,
+              assignedCity: d.assignedCity,
+            }));
+          if (valid.length > 0) setFleetDrivers(valid);
+        }
+      })
+      .catch((err) => console.warn('Error fetching fleet status for map:', err));
+
+    return () => {
+      if (watchId !== null && navigator.geolocation) {
+        navigator.geolocation.clearWatch(watchId);
       }
     };
+  }, []);
 
-    upsertPolyline(activePolylineRef, activePath, {
-      strokeColor: '#10b981',
-      strokeWeight: isMobile ? 6 : 8,
-      strokeOpacity: 1,
-      zIndex: 10,
-      clickable: false,
-      icons: [{
-        icon: {
-          path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
-          scale: 3,
-          fillColor: '#fff',
-          fillOpacity: 1,
-          strokeColor: '#10b981',
-        },
-        offset: '0',
-        repeat: '80px',
-      }],
-    });
-
-    upsertPolyline(futurePolylineRef, futurePath, {
-      strokeColor: '#10b981',
-      strokeOpacity: 0.25,
-      strokeWeight: isMobile ? 4 : 5,
-      zIndex: 5,
-      clickable: false,
-      icons: [{
-        icon: {
-          path: google.maps.SymbolPath.FORWARD_CLOSED_ARROW,
-          scale: 2,
-          fillColor: '#10b981',
-          fillOpacity: 0.4,
-          strokeColor: 'transparent',
-        },
-        offset: '0',
-        repeat: '100px',
-      }],
-    });
-  }, [activePath, futurePath, isMobile, routeVersion]);
-
-  const allStops = useMemo((): MapStop[] => {
-    const routeStops = Array.isArray(route?.stops) ? route.stops : [];
-    const routeById = new Map<number | string, MapStop>(
-      routeStops
-        .map((item: Record<string, unknown>) => normalizeStop(item))
-        .filter((stop: MapStop) => stop.id !== undefined)
-        .map((stop: MapStop) => [stop.id as number | string, stop])
-    );
-    const raw: unknown[] = backupOrders.length > 0 ? backupOrders : routeStops;
-    return raw
-      .map((item) => {
-        const normalized = normalizeStop(item as Record<string, unknown>);
-        const routeStop = normalized.id !== undefined ? routeById.get(normalized.id) : undefined;
-        return {
-          ...routeStop,
-          ...normalized,
-          lat: Number.isNaN(normalized.lat) ? Number(routeStop?.lat) : normalized.lat,
-          lng: Number.isNaN(normalized.lng) ? Number(routeStop?.lng) : normalized.lng,
-        };
-      })
-      .filter((stop: MapStop) => !Number.isNaN(stop.lat) && !Number.isNaN(stop.lng));
+  // Normalizar paradas de pedidos: Mostrar TODOS los pedidos asignados sin limitar por lote (hasta 100+ pedidos)
+  const rawStops: MapStop[] = useMemo(() => {
+    const rawList = route?.orders?.length ? route.orders : backupOrders;
+    const list = Array.isArray(rawList) ? rawList : [];
+    return list
+      .map((o: any) => ({
+        id: o.id,
+        batchId: o.batchId,
+        deliveryOrder: o.deliveryOrder ?? o.delivery_order ?? undefined,
+        lat: Number(o.lat ?? o.latitude ?? o.location?.lat),
+        lng: Number(o.lng ?? o.longitude ?? o.location?.lng),
+        status: o.status,
+        address: o.address,
+        city: o.city || 'Pasto',
+        priority: o.priority,
+        clientName: o.clientName,
+        clientReference: o.clientReference,
+        phone: o.phone,
+        price: o.price,
+        notes: o.notes || o.observations,
+      })).filter((s: MapStop) => !isNaN(s.lat) && !isNaN(s.lng));
   }, [route, backupOrders]);
 
-  const activeStops = useMemo(
-    () => allStops.filter((stop: MapStop) => isActiveStop(stop)),
-    [allStops]
-  );
+  // Distancia euclidiana / haversine para calcular proximidad geografica
+  const getDistanceSq = (p1: { lat: number; lng: number }, p2: { lat: number; lng: number }) => {
+    const dLat = p1.lat - p2.lat;
+    const dLng = (p1.lng - p2.lng) * Math.cos((p1.lat * Math.PI) / 180);
+    return dLat * dLat + dLng * dLng;
+  };
 
   const displayedStops = useMemo(() => {
-    if (currentWaypoints.length === 0) return activeStops;
-    const activeIds = new Set(activeStops.map((stop) => stop.id).filter(Boolean));
-    const reconciled = currentWaypoints.filter((stop) => !stop.id || activeIds.has(stop.id));
-    return reconciled.length > 0 ? reconciled : activeStops;
-  }, [activeStops, currentWaypoints]);
-  const nextStop = displayedStops[0] ?? null;
-  const activeOrderId = nextStop?.id ?? null;
-  const routeRenderKey = useMemo(
-    () => `route-${optMode}-${activeOrderId ?? 'none'}-${routeVersion}`,
-    [activeOrderId, optMode, routeVersion]
-  );
+    const active = rawStops.filter((s) => !s.status || !COMPLETED_STATUSES.has(s.status));
+    if (active.length <= 1) return active;
 
-  const activeStopsSignature = useMemo(
-    () => activeStops.map((stop) => `${stop.id ?? `${stop.lat},${stop.lng}`}:${stop.status ?? 'ACTIVE'}`).join('|'),
-    [activeStops]
-  );
+    if (optMode === 'PRIORITY') {
+      const [first, ...rest] = active;
+      return [
+        first,
+        ...rest.sort((a, b) => (PRIORITY_RANK[b.priority || ''] ?? 0) - (PRIORITY_RANK[a.priority || ''] ?? 0)),
+      ];
+    }
 
+    // MODO EFFICIENCY:
+    // 1. Si los pedidos ya tienen una secuencia optimizada asignada por el backend (deliveryOrder), respetarla
+    const hasDeliveryOrder = active.some((s) => typeof s.deliveryOrder === 'number' && s.deliveryOrder > 0);
+    if (hasDeliveryOrder) {
+      return [...active].sort((a, b) => (a.deliveryOrder ?? 9999) - (b.deliveryOrder ?? 9999));
+    }
+
+    // 2. Si no tienen deliveryOrder, usar Vecino Más Cercano (Nearest Neighbor) natural paso a paso sin distorsiones
+    const remaining = [...active];
+    const ordered: MapStop[] = [];
+    let currentPoint = driverPos || { lat: remaining[0].lat, lng: remaining[0].lng };
+
+    while (remaining.length > 0) {
+      let nearestIdx = 0;
+      let minDistance = Infinity;
+
+      for (let i = 0; i < remaining.length; i++) {
+        const dist = getDistanceSq(currentPoint, remaining[i]);
+        if (dist < minDistance) {
+          minDistance = dist;
+          nearestIdx = i;
+        }
+      }
+
+      const [nextStop] = remaining.splice(nearestIdx, 1);
+      ordered.push(nextStop);
+      currentPoint = { lat: nextStop.lat, lng: nextStop.lng };
+    }
+
+    return ordered;
+  }, [rawStops, optMode, driverPos]);
+
+  const nextStop = displayedStops[0];
+
+  // Inicializar Leaflet con OpenStreetMap
   useEffect(() => {
-    if (!isLoaded || !driverPos) return;
-    if (activeStops.length === 0) {
-      setActiveOrder(null);
-      clearRouteVisuals();
-      setLoading(false);
-      return;
-    }
+    if (!mapContainerRef.current) return;
 
-    const now = Date.now();
-    const runImmediately = lastDirectionsSyncRef.current === 0;
-    const elapsed = now - lastDirectionsSyncRef.current;
+    const checkLeaflet = setInterval(() => {
+      if (typeof L !== 'undefined') {
+        clearInterval(checkLeaflet);
 
-    if (dynamicRouteTimerRef.current) clearTimeout(dynamicRouteTimerRef.current);
+        if (!leafletMapRef.current && mapContainerRef.current) {
+          const center = driverPos || (displayedStops.length > 0 ? { lat: displayedStops[0].lat, lng: displayedStops[0].lng } : { lat: 1.2136, lng: -77.2811 });
+          const map = L.map(mapContainerRef.current, {
+            center: [center.lat, center.lng],
+            zoom: 14,
+            zoomControl: false,
+          });
 
-    const recalc = () => {
-      lastDirectionsSyncRef.current = Date.now();
-      buildRemainingDirections(activeStops, driverPos, optMode, runImmediately);
-    };
+          // OpenStreetMap 100% libre sin API Key jamás
+          const tileUrl = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
 
-    if (runImmediately || elapsed >= ROUTE_RECALC_INTERVAL_MS) {
-      recalc();
-    } else {
-      dynamicRouteTimerRef.current = setTimeout(recalc, ROUTE_RECALC_INTERVAL_MS - elapsed);
-    }
+          tileLayerRef.current = L.tileLayer(tileUrl, {
+            maxZoom: 19,
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+          }).addTo(map);
+
+          markersLayerRef.current = L.layerGroup().addTo(map);
+          fleetMarkersLayerRef.current = L.layerGroup().addTo(map);
+
+          map.on('dragstart', () => setIsFollowing(false));
+
+          leafletMapRef.current = map;
+          setMapReady(true);
+          setLoading(false);
+
+          setTimeout(() => {
+            if (leafletMapRef.current) {
+              leafletMapRef.current.invalidateSize();
+            }
+          }, 200);
+        }
+      }
+    }, 50);
 
     return () => {
-      if (dynamicRouteTimerRef.current) clearTimeout(dynamicRouteTimerRef.current);
+      clearInterval(checkLeaflet);
+      if (leafletMapRef.current) {
+        leafletMapRef.current.remove();
+        leafletMapRef.current = null;
+        setMapReady(false);
+      }
     };
-  }, [
-    activeStopsSignature,
-    buildRemainingDirections,
-    clearRouteVisuals,
-    driverPos?.lat,
-    driverPos?.lng,
-    isLoaded,
-    optMode,
-    setActiveOrder,
-  ]);
+  }, []);
+
+  // Cambiar tema de mapa (Light / Dark) sin CartoDB para evitar marcas de agua 'API KEY REQUIRED'
+  useEffect(() => {
+    if (!leafletMapRef.current || !tileLayerRef.current) return;
+    
+    // Siempre usar los tiles libres de OpenStreetMap oficial
+    const tileUrl = 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+    tileLayerRef.current.setUrl(tileUrl);
+    
+    // Aplicar filtro dark directo al contenedor de tiles para un verdadero modo oscuro limpio
+    const mapEl = mapContainerRef.current;
+    if (mapEl) {
+      const tilePane = mapEl.querySelector('.leaflet-tile-pane') as HTMLElement;
+      if (tilePane) {
+        if (mapTheme === 'dark') {
+          tilePane.style.filter = 'brightness(0.65) invert(1) contrast(2.8) hue-rotate(195deg) saturate(0.35)';
+        } else {
+          tilePane.style.filter = 'none';
+        }
+      }
+    }
+  }, [mapTheme]);
+
+  // Dibujar paradas de pedidos en Leaflet
+  useEffect(() => {
+    if (!leafletMapRef.current || !markersLayerRef.current || typeof L === 'undefined') return;
+
+    markersLayerRef.current.clearLayers();
+
+    displayedStops.forEach((stop, idx) => {
+      const isNext = idx === 0;
+      const markerColor = isNext ? '#10b981' : stop.priority === 'HIGH' ? '#f43f5e' : '#6366f1';
+
+      const customIcon = L.divIcon({
+        className: 'custom-stop-marker',
+        html: `
+          <div style="background-color: ${markerColor}; width: 30px; height: 30px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; font-weight: 900; font-size: 11px; border: 2.5px solid white; box-shadow: 0 4px 14px rgba(0,0,0,0.3); cursor: pointer; transition: transform 0.2s;">
+            ${idx + 1}
+          </div>
+        `,
+        iconSize: [30, 30],
+        iconAnchor: [15, 15],
+      });
+
+      const marker = L.marker([stop.lat, stop.lng], { icon: customIcon });
+      marker.on('click', () => {
+        setSelectedOrder({ ...stop, stopNumber: idx + 1 });
+        setSelectedDriver(null);
+        if (leafletMapRef.current) {
+          leafletMapRef.current.setView([stop.lat, stop.lng], 16, { animate: true });
+        }
+      });
+      markersLayerRef.current.addLayer(marker);
+    });
+
+    if (mapReady && displayedStops.length > 0) {
+      // Ajustar vista inicial
+      const allCoords: [number, number][] = displayedStops.map((s) => [s.lat, s.lng]);
+      if (driverPos) allCoords.push([driverPos.lat, driverPos.lng]);
+      const bounds = L.latLngBounds(allCoords);
+      leafletMapRef.current.fitBounds(bounds, { padding: [50, 50], maxZoom: 15 });
+    }
+  }, [displayedStops, mapReady]);
+
+  // Dibujar TODOS LOS CARROS DE LA FLOTA en tiempo real en el mapa
+  useEffect(() => {
+    if (!leafletMapRef.current || !fleetMarkersLayerRef.current || typeof L === 'undefined') return;
+
+    fleetMarkersLayerRef.current.clearLayers();
+
+    // 1. Dibujar el vehículo del conductor local si existe
+    if (driverPos) {
+      const driverIcon = L.divIcon({
+        className: 'driver-gps-marker',
+        html: `
+          <div style="position: relative; display: flex; align-items: center; justify-content: center;">
+            <div style="position: absolute; width: 40px; height: 40px; border-radius: 50%; background-color: rgba(59, 130, 246, 0.3); animation: ping 1.5s cubic-bezier(0, 0, 0.2, 1) infinite;"></div>
+            <div style="background: linear-gradient(135deg, #2563eb, #1d4ed8); width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: white; border: 3px solid white; box-shadow: 0 4px 14px rgba(37,99,235,0.4); z-index: 10;">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polygon points="3 11 22 2 13 21 11 13 3 11"/></svg>
+            </div>
+          </div>
+        `,
+        iconSize: [40, 40],
+        iconAnchor: [20, 20],
+      });
+
+      const selfMarker = L.marker([driverPos.lat, driverPos.lng], { icon: driverIcon, zIndexOffset: 1000 });
+      fleetMarkersLayerRef.current.addLayer(selfMarker);
+
+      if (isFollowing) {
+        leafletMapRef.current.panTo([driverPos.lat, driverPos.lng]);
+      }
+    }
+
+    // 2. Dibujar CADA CARRO de la flota activa
+    Object.values(fleetDrivers).forEach((drv) => {
+      const isBusy = drv.status === 'ON_ROUTE' || drv.status === 'BUSY';
+      const bgColor = isBusy ? '#6366f1' : '#14b8a6';
+
+      const fleetIcon = L.divIcon({
+        className: 'fleet-vehicle-marker',
+        html: `
+          <div style="display: flex; flex-direction: column; align-items: center;">
+            <div style="background: ${bgColor}; padding: 3px 8px; border-radius: 8px; color: white; font-size: 9px; font-weight: 900; text-transform: uppercase; border: 1.5px solid white; box-shadow: 0 2px 8px rgba(0,0,0,0.2); white-space: nowrap; margin-bottom: 2px;">
+              ${drv.driverName.split(' ')[0]}
+            </div>
+            <div style="background: white; width: 28px; height: 28px; border-radius: 50%; display: flex; align-items: center; justify-content: center; color: ${bgColor}; border: 2.5px solid ${bgColor}; box-shadow: 0 4px 10px rgba(0,0,0,0.2);">
+              <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><rect x="1" y="3" width="15" height="13"></rect><polygon points="16 8 20 8 23 11 23 16 16 16 16 8"></polygon><circle cx="5.5" cy="18.5" r="2.5"></circle><circle cx="18.5" cy="18.5" r="2.5"></circle></svg>
+            </div>
+          </div>
+        `,
+        iconSize: [60, 50],
+        iconAnchor: [30, 48],
+      });
+
+      const marker = L.marker([drv.lat, drv.lng], { icon: fleetIcon });
+      marker.on('click', () => {
+        setSelectedDriver(drv);
+        setSelectedOrder(null);
+      });
+      fleetMarkersLayerRef.current.addLayer(marker);
+    });
+  }, [driverPos, fleetDrivers, isFollowing, mapReady]);
+
+  // Trazar ruta libre con OSRM hacia la siguiente parada
+  useEffect(() => {
+    if (!leafletMapRef.current || typeof L === 'undefined' || !mapReady) return;
+
+    if (routePolylineRef.current) {
+      leafletMapRef.current.removeLayer(routePolylineRef.current);
+      routePolylineRef.current = null;
+    }
+
+    if (!driverPos || !nextStop) return;
+
+    // Consultar servicio libre OSRM
+    const osrmUrl = `https://router.project-osrm.org/route/v1/driving/${driverPos.lng},${driverPos.lat};${nextStop.lng},${nextStop.lat}?overview=full&geometries=geojson`;
+
+    fetch(osrmUrl)
+      .then((res) => res.json())
+      .then((data) => {
+        if (data.code === 'Ok' && data.routes?.length > 0) {
+          const routeData = data.routes[0];
+          const coords = routeData.geometry.coordinates.map((c: [number, number]) => [c[1], c[0]]);
+
+          const durationMin = Math.round(routeData.duration / 60);
+          const distanceKm = (routeData.distance / 1000).toFixed(1);
+          setEtaInfo({
+            duration: `${durationMin} min`,
+            distance: `${distanceKm} km`,
+          });
+
+          if (leafletMapRef.current) {
+            routePolylineRef.current = L.polyline(coords, {
+              color: '#10b981',
+              weight: 5,
+              opacity: 0.85,
+              lineCap: 'round',
+            }).addTo(leafletMapRef.current);
+          }
+        }
+      })
+      .catch((err) => console.warn('OSRM Route fetch error:', err));
+  }, [driverPos, nextStop]);
 
   const fitAll = useCallback(() => {
-    if (!mapRef.current || displayedStops.length === 0) return;
-    setIsFollowing(false);
-    const b = new google.maps.LatLngBounds();
-    displayedStops.forEach((stop: MapStop) => b.extend({ lat: stop.lat, lng: stop.lng }));
-    if (driverPos) b.extend(driverPos);
-    mapRef.current.fitBounds(b, {
-      top: isMobile ? 88 : 100,
-      bottom: isMobile ? 140 : 250,
-      left: 48,
-      right: 48,
-    });
-  }, [displayedStops, driverPos, isMobile]);
+    if (!leafletMapRef.current || typeof L === 'undefined') return;
+    const allCoords: [number, number][] = [];
 
-  const handleMapZoomChange = useCallback(() => {
-    if (isFollowing) setIsFollowing(false);
-  }, [isFollowing]);
+    if (driverPos) allCoords.push([driverPos.lat, driverPos.lng]);
+    displayedStops.forEach((s) => allCoords.push([s.lat, s.lng]));
+    Object.values(fleetDrivers).forEach((d) => allCoords.push([d.lat, d.lng]));
 
-  const mapOptions = useMemo(
-    () => ({
-      disableDefaultUI: true,
-      clickableIcons: false,
-      styles: mapStyles,
-      gestureHandling: 'greedy' as const,
-      tilt: isMobile ? 0 : isFollowing ? 45 : 0,
-      zoomControl: false,
-      mapTypeControl: false,
-      streetViewControl: false,
-      fullscreenControl: false,
-    }),
-    [mapStyles, isFollowing, isMobile]
-  );
-
-  if (loadError) return <div className="p-8">Error: {loadError.message}</div>;
-  if (!isLoaded || (loading && !driverPos)) return <div className="w-full h-full flex flex-col items-center justify-center bg-white"><Loader2 className="w-12 h-12 text-emerald-500 animate-spin mb-4" /><p className="text-sm font-black text-slate-900 uppercase tracking-widest animate-pulse">Iniciando Navegación...</p></div>;
+    if (allCoords.length > 0) {
+      const bounds = L.latLngBounds(allCoords);
+      leafletMapRef.current.fitBounds(bounds, { padding: [50, 50] });
+    }
+  }, [driverPos, displayedStops, fleetDrivers]);
 
   return (
-    <div
-      data-route-key={routeRenderKey}
-      className={`relative w-full h-full min-h-0 overflow-hidden overscroll-none ${mapTheme === 'dark' ? 'bg-slate-950' : 'bg-slate-50'}`}
-    >
-      <GoogleMap
-        mapContainerStyle={containerStyle}
-        center={initialCenter}
-        zoom={16}
-        onLoad={(m) => {
-          mapRef.current = m;
-        }}
-        onDragStart={() => {
-          isMapDraggingRef.current = true;
-          setIsFollowing(false);
-        }}
-        onDragEnd={() => {
-          isMapDraggingRef.current = false;
-        }}
-        onZoomChanged={handleMapZoomChange}
-        options={mapOptions}
-      >
-        {displayedStops.map((stop: MapStop, idx: number) => (
-          <MarkerF
-            key={`stop-${stop.id ?? idx}`}
-            position={{ lat: stop.lat, lng: stop.lng }}
-            onClick={() => setSelectedOrder(stop)}
-            label={{ text: (idx + 1).toString(), color: 'white', fontWeight: '900', fontSize: '11px' }}
-            icon={{
-              path: google.maps.SymbolPath.CIRCLE,
-              fillColor: idx === 0 ? '#fbbf24' : '#f43f5e',
-              fillOpacity: 1,
-              strokeColor: '#fff',
-              strokeWeight: 2,
-              scale: isMobile ? 7 : 8,
-            }}
-          />
-        ))}
+    <div className="relative w-full h-full overflow-hidden bg-slate-900 select-none">
+      {/* Contenedor Leaflet OpenStreetMap */}
+      <div ref={mapContainerRef} className="w-full h-full z-0" />
 
-        {driverPos && (
-          <>
-            <OverlayViewF
-              position={driverPos}
-              mapPaneName={OverlayView.OVERLAY_LAYER}
-            >
-              <div className="pointer-events-none relative flex h-0 w-0 items-center justify-center">
-                <div className="absolute h-10 w-10 -translate-x-1/2 -translate-y-1/2 rounded-full bg-blue-500/25 animate-pulse" />
-              </div>
-            </OverlayViewF>
-            <MarkerF
-              position={driverPos}
-              zIndex={1000}
-              icon={{
-                path: 'M12 2L4.5 20.29l.71.71L12 18l6.79 3 .71-.71z',
-                fillColor: '#3b82f6',
-                fillOpacity: 1,
-                strokeColor: '#fff',
-                strokeWeight: 2,
-                scale: isMobile ? 1.35 : 1.5,
-                anchor: new google.maps.Point(GPS_ICON_SIZE / 2, GPS_ICON_SIZE / 2),
-                rotation: deviceHeading,
-              }}
-            />
-          </>
-        )}
-      </GoogleMap>
-
+      {/* Tarjeta de Detalle del Pedido Seleccionado (Al tocar el marcador en el mapa) */}
       <AnimatePresence>
         {selectedOrder && (
           <motion.div
-            key={`map-order-card-${selectedOrder.id ?? selectedOrder.clientReference ?? 'selected'}`}
-            initial={{ opacity: 0, y: 20, x: '-50%', scale: 0.98 }}
-            animate={{ opacity: 1, y: 0, x: '-50%', scale: 1 }}
-            exit={{ opacity: 0, y: 16, x: '-50%', scale: 0.98 }}
-            transition={{ duration: 0.18, ease: 'easeOut' }}
-            className="absolute bottom-24 left-1/2 -translate-x-1/2 w-[90%] max-w-sm bg-white rounded-2xl shadow-2xl z-40 p-4 backdrop-blur-md border border-slate-100 pointer-events-auto touch-manipulation"
+            initial={{ opacity: 0, y: 30, x: '-50%' }}
+            animate={{ opacity: 1, y: 0, x: '-50%' }}
+            exit={{ opacity: 0, y: 30, x: '-50%' }}
+            className="absolute bottom-28 sm:bottom-32 left-1/2 z-50 w-[94%] max-w-sm pointer-events-auto"
           >
-            <button
-              type="button"
-              onClick={() => setSelectedOrder(null)}
-              className="absolute right-3 top-3 flex h-9 w-9 items-center justify-center rounded-xl bg-slate-100 text-slate-500 transition-all active:scale-95"
-              aria-label="Cerrar detalle de pedido"
-            >
-              <X size={17} />
-            </button>
-
-            <div className="pr-10">
-              <div className="mb-3 flex items-center gap-2">
-                <span className={`rounded-full px-2.5 py-1 text-[9px] font-black uppercase tracking-widest ${selectedOrder.status === 'ON_ROUTE' ? 'bg-blue-100 text-blue-700' : selectedOrder.status === 'DELIVERED' ? 'bg-emerald-100 text-emerald-700' : selectedOrder.status === 'CANCELLED' ? 'bg-red-100 text-red-700' : 'bg-orange-100 text-orange-700'}`}>
-                  {selectedOrder.status || 'Pendiente'}
-                </span>
-                <span className={`rounded-full px-2.5 py-1 text-[9px] font-black uppercase tracking-widest ${selectedOrder.priority === 'HIGH' ? 'bg-red-100 text-red-700' : selectedOrder.priority === 'MEDIUM' ? 'bg-amber-100 text-amber-700' : 'bg-slate-100 text-slate-600'}`}>
-                  {selectedOrder.priority === 'HIGH' ? 'Alta' : selectedOrder.priority === 'MEDIUM' ? 'Media' : 'Baja'}
-                </span>
+            <div className="bg-white/98 backdrop-blur-2xl p-5 rounded-3xl shadow-2xl border border-slate-200">
+              <div className="flex justify-between items-start mb-3">
+                <div className="min-w-0 pr-2">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-[10px] font-black uppercase tracking-wider text-emerald-700 bg-emerald-100 px-2.5 py-0.5 rounded-full">
+                      Parada #{selectedOrder.stopNumber || selectedOrder.deliveryOrder || selectedOrder.id}
+                    </span>
+                    {selectedOrder.priority && (
+                      <span className={`text-[10px] font-black uppercase px-2 py-0.5 rounded-full ${
+                        selectedOrder.priority === 'HIGH' ? 'bg-rose-100 text-rose-700' : 'bg-slate-100 text-slate-700'
+                      }`}>
+                        {selectedOrder.priority}
+                      </span>
+                    )}
+                  </div>
+                  <h4 className="text-base font-black text-slate-900 leading-tight truncate">{selectedOrder.address}</h4>
+                  <p className="text-xs text-slate-500 font-bold mt-0.5">
+                    {selectedOrder.clientName || 'Cliente'} {selectedOrder.clientReference ? `• Ref: ${selectedOrder.clientReference}` : ''}
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setSelectedOrder(null)}
+                  className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-500 transition-colors shrink-0"
+                >
+                  <X size={16} />
+                </button>
               </div>
 
-              <div className="space-y-3">
-                <div className="flex items-start gap-3">
-                  <User className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
-                  <div className="min-w-0">
-                    <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Cliente</p>
-                    <p className="truncate text-sm font-black text-slate-900">
-                      {(selectedOrder.clientName && selectedOrder.clientName !== 'Cliente VibeRoute' && selectedOrder.clientName !== 'Cliente Viberoute') ? selectedOrder.clientName : (selectedOrder.clientReference || 'Sin nombre')}
+              {/* Información Adicional del Pedido */}
+              <div className="grid grid-cols-2 gap-2 my-2 py-2 border-y border-slate-100 text-[11px]">
+                <div>
+                  <span className="text-slate-400 font-bold block text-[9px] uppercase tracking-wider">Ciudad</span>
+                  <span className="font-black text-slate-700">{selectedOrder.city || 'Pasto'}</span>
+                </div>
+                {selectedOrder.price && (
+                  <div>
+                    <span className="text-slate-400 font-bold block text-[9px] uppercase tracking-wider">Valor / Cobro</span>
+                    <span className="font-black text-emerald-600">${Number(selectedOrder.price).toLocaleString('es-CO')}</span>
+                  </div>
+                )}
+                {selectedOrder.notes && (
+                  <div className="col-span-2 bg-amber-50 p-2 rounded-xl text-amber-800 text-[10px] font-medium border border-amber-100 mt-1">
+                    <span className="font-bold">Nota:</span> {selectedOrder.notes}
+                  </div>
+                )}
+              </div>
+
+              {/* Botón de Llamada */}
+              {selectedOrder.phone ? (
+                <a
+                  href={`tel:${selectedOrder.phone}`}
+                  className="mt-2 flex items-center justify-center gap-2 w-full py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 font-black text-xs uppercase tracking-wider rounded-2xl transition-all"
+                >
+                  <Phone size={14} className="text-emerald-600" /> Llamar al Cliente ({selectedOrder.phone})
+                </a>
+              ) : (
+                <div className="mt-2 py-2 px-3 bg-slate-100 rounded-xl text-center text-xs text-slate-400 font-medium">
+                  Sin teléfono registrado
+                </div>
+              )}
+
+              {/* Botón de Acción Directa: Entregar Pedido */}
+              <button
+                type="button"
+                onClick={async () => {
+                  try {
+                    await api.put(`/orders/${selectedOrder.id}/status?status=DELIVERED`);
+                    // Actualizar estado en store local
+                    const currentOrders = useRouteStore.getState().backupOrders;
+                    useRouteStore.getState().setBackupOrders(
+                      currentOrders.map((o: any) => o.id === selectedOrder.id ? { ...o, status: 'DELIVERED' } : o)
+                    );
+                    setSelectedOrder(null);
+                  } catch (e) {
+                    console.error('Error al entregar pedido:', e);
+                    alert('No se pudo marcar la entrega. Verifica la conexión.');
+                  }
+                }}
+                className="mt-2 flex items-center justify-center gap-2 w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-black text-xs uppercase tracking-wider rounded-2xl shadow-lg shadow-emerald-600/30 active:scale-95 transition-all"
+              >
+                <CheckCircle2 size={16} /> Marcar como Entregado
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+
+      {/* Tarjeta de Conductor de la Flota Seleccionado */}
+      <AnimatePresence>
+        {selectedDriver && (
+          <motion.div
+            initial={{ opacity: 0, y: 20, x: '-50%' }}
+            animate={{ opacity: 1, y: 0, x: '-50%' }}
+            exit={{ opacity: 0, y: 20, x: '-50%' }}
+            className="absolute bottom-28 left-1/2 z-40 w-[92%] max-w-sm pointer-events-auto"
+          >
+            <div className="bg-white/95 backdrop-blur-xl p-5 rounded-3xl shadow-2xl border border-slate-200">
+              <div className="flex justify-between items-start mb-2">
+                <div className="flex items-center gap-3">
+                  <div className="w-10 h-10 rounded-2xl bg-indigo-500 flex items-center justify-center text-white">
+                    <Truck size={20} />
+                  </div>
+                  <div>
+                    <h4 className="text-sm font-black text-slate-900">{selectedDriver.driverName}</h4>
+                    <p className="text-[10px] font-bold text-slate-400 uppercase tracking-wider">
+                      {selectedDriver.assignedCity || 'Pasto'} • {selectedDriver.status}
                     </p>
                   </div>
                 </div>
-
-                <div className="flex items-start gap-3">
-                  <MapPin className="mt-0.5 h-4 w-4 shrink-0 text-emerald-500" />
-                  <div className="min-w-0">
-                    <p className="text-[10px] font-bold uppercase tracking-widest text-slate-400">Dirección</p>
-                    <p className="text-xs font-bold leading-snug text-slate-700">{selectedOrder.address}</p>
-                  </div>
-                </div>
-              </div>
-
-              <div className="mt-4 grid grid-cols-2 gap-2">
-                <a
-                  href={`tel:${selectedOrder.phone || '3000000000'}`}
-                  className="flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-slate-100 px-4 text-xs font-black text-slate-700 transition-all active:scale-95"
-                >
-                  <Phone size={15} />
-                  Llamar
-                </a>
                 <button
                   type="button"
-                  onClick={() => {
-                    setIsFollowing(true);
-                    if (mapRef.current && selectedOrder.lat && selectedOrder.lng) {
-                      mapRef.current.panTo({ lat: selectedOrder.lat, lng: selectedOrder.lng });
-                    }
-                  }}
-                  className="flex min-h-[44px] items-center justify-center gap-2 rounded-xl bg-emerald-500 px-4 text-xs font-black text-white shadow-lg shadow-emerald-500/20 transition-all active:scale-95"
+                  onClick={() => setSelectedDriver(null)}
+                  className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-500"
                 >
-                  <Navigation size={15} />
-                  Enfocar
+                  <X size={16} />
                 </button>
+              </div>
+              <div className="mt-3 p-3 bg-slate-50 rounded-xl text-[10px] font-mono text-slate-600">
+                Coordenadas en vivo: {selectedDriver.lat.toFixed(5)}, {selectedDriver.lng.toFixed(5)}
               </div>
             </div>
           </motion.div>
         )}
       </AnimatePresence>
 
+      {/* Barra Superior Flotante: Selector de Modo (Sin emojis) + Información de Próximo Destino */}
+      <div className="absolute top-3 inset-x-3 z-30 pointer-events-none flex flex-col gap-2">
+        <div className="flex items-center justify-between gap-2">
+          {/* Switcher Eficiencia / Prioridad */}
+          <div className="pointer-events-auto bg-white/95 backdrop-blur-md p-1 rounded-2xl shadow-xl border border-slate-200/90 flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => setOptMode('EFFICIENCY')}
+              className={`min-h-[36px] px-3.5 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all duration-200 ${
+                optMode === 'EFFICIENCY'
+                  ? 'bg-slate-900 text-white shadow-md'
+                  : 'text-slate-500 hover:text-slate-900'
+              }`}
+            >
+              Eficiencia
+            </button>
+            <button
+              type="button"
+              onClick={() => setOptMode('PRIORITY')}
+              className={`min-h-[36px] px-3.5 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider transition-all duration-200 ${
+                optMode === 'PRIORITY'
+                  ? 'bg-emerald-600 text-white shadow-md shadow-emerald-600/30'
+                  : 'text-slate-500 hover:text-slate-900'
+              }`}
+            >
+              Prioridad
+            </button>
+          </div>
+        </div>
 
-      <div className="absolute top-[max(1rem,env(safe-area-inset-top))] left-4 z-20 pointer-events-none w-full max-w-[calc(100%-7.5rem)]">
+        {/* Banner Superior de Siguiente Parada (Clickeable para enfocar directamente el pedido) */}
         <AnimatePresence mode="wait">
           {nextStop && etaInfo && (
-            <motion.div 
+            <motion.div
               key={nextStop.id}
               initial={{ opacity: 0, y: -8 }}
               animate={{ opacity: 1, y: 0 }}
               exit={{ opacity: 0, y: -8 }}
-              transition={{ duration: 0.2 }}
-              className="bg-white/95 backdrop-blur-xl p-4 rounded-[2.5rem] border border-slate-200 shadow-2xl pointer-events-auto touch-manipulation"
+              onClick={() => {
+                setSelectedOrder({ ...nextStop, stopNumber: 1 });
+                setSelectedDriver(null);
+                if (leafletMapRef.current) {
+                  leafletMapRef.current.setView([nextStop.lat, nextStop.lng], 16, { animate: true });
+                }
+              }}
+              className="bg-white/95 backdrop-blur-xl p-3 sm:p-4 rounded-3xl border border-slate-200 shadow-2xl pointer-events-auto max-w-md cursor-pointer hover:border-emerald-300 hover:shadow-emerald-500/10 transition-all active:scale-[0.98]"
             >
-              <div className="flex items-start gap-4">
-                <div className="bg-gradient-to-br from-emerald-500 to-emerald-700 p-3 rounded-2xl text-white shadow-lg shadow-emerald-500/20"><Navigation className="w-6 h-6" fill="currentColor" /></div>
+              <div className="flex items-start gap-3">
+                <div className="bg-gradient-to-br from-emerald-500 to-emerald-700 p-2.5 rounded-2xl text-white shadow-lg shadow-emerald-500/20 shrink-0">
+                  <Navigation className="w-5 h-5" fill="currentColor" />
+                </div>
                 <div className="flex-1 min-w-0">
-                  <p className="text-[10px] text-emerald-600 font-black uppercase tracking-widest">Siguiente Destino</p>
-                  <p className="text-sm text-slate-900 font-black truncate">{nextStop.address}</p>
-                  <div className="flex items-center gap-3 mt-2 text-[11px] font-black">
-                    <span className="flex items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-xl text-slate-700 border border-slate-200"><Clock className="w-3.5 h-3.5 text-emerald-600" /> {etaInfo.duration}</span>
-                    <span className="flex items-center gap-1.5 bg-slate-100 px-2.5 py-1 rounded-xl text-slate-700 border border-slate-200"><MapPin className="w-3.5 h-3.5 text-emerald-600" /> {etaInfo.distance}</span>
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[10px] text-emerald-600 font-black uppercase tracking-widest">Siguiente Destino</p>
+                    <span className="text-[10px] font-mono font-bold bg-slate-100 text-slate-700 px-2 py-0.5 rounded-full">
+                      #1
+                    </span>
+                  </div>
+                  <p className="text-xs sm:text-sm text-slate-900 font-black truncate">{nextStop.address}</p>
+                  <div className="flex items-center gap-2 mt-1.5 text-[10px] font-black">
+                    <span className="flex items-center gap-1 bg-slate-100 px-2 py-0.5 rounded-lg text-slate-700 border border-slate-200">
+                      <Clock className="w-3 h-3 text-emerald-600" /> {etaInfo.duration}
+                    </span>
+                    <span className="flex items-center gap-1 bg-slate-100 px-2 py-0.5 rounded-lg text-slate-700 border border-slate-200">
+                      <MapPin className="w-3 h-3 text-emerald-600" /> {etaInfo.distance}
+                    </span>
                   </div>
                 </div>
               </div>
@@ -736,56 +651,66 @@ export const MapsNavigationModule: React.FC = () => {
         </AnimatePresence>
       </div>
 
-      <div className="absolute top-[max(1rem,env(safe-area-inset-top))] right-4 z-20 flex flex-col gap-3 pointer-events-none">
-        <button type="button" onClick={() => setMapTheme(mapTheme === 'light' ? 'dark' : 'light')} className="pointer-events-auto touch-manipulation min-h-[44px] min-w-[44px] bg-white/95 backdrop-blur-md p-4 rounded-2xl text-slate-900 shadow-xl border border-slate-200 active:scale-95">{mapTheme === 'light' ? <Moon className="w-5 h-5" /> : <Sun className="w-5 h-5" />}</button>
-        <button type="button" onClick={fitAll} className="pointer-events-auto touch-manipulation min-h-[44px] min-w-[44px] bg-white/95 p-4 rounded-2xl text-slate-900 shadow-xl border border-slate-200 active:scale-95"><Target className="w-5 h-5" /></button>
-        
-        {/* BOTÓN RECENTRAR: Visible cuando isFollowing es false */}
-        <AnimatePresence>
-          {!isFollowing && driverPos && (
-            <motion.button
-              type="button"
-              initial={{ opacity: 0, scale: 0.95 }}
-              animate={{ opacity: 1, scale: 1 }}
-              exit={{ opacity: 0, scale: 0.95 }}
-              transition={{ duration: 0.15 }}
-              onClick={() => {
-                setIsFollowing(true);
-                if (mapRef.current && driverPos) mapRef.current.panTo(driverPos);
-              }}
-              className="pointer-events-auto touch-manipulation min-h-[44px] min-w-[44px] bg-blue-500 text-white p-4 rounded-2xl shadow-xl shadow-blue-500/30 flex items-center justify-center border border-blue-400 active:scale-95"
-            >
-              <Navigation className="w-5 h-5" fill="currentColor" />
-            </motion.button>
-          )}
-        </AnimatePresence>
+      {/* Botones de Control de Mapa (Derecha) */}
+      <div className="absolute top-3 right-3 z-30 flex flex-col gap-2 pointer-events-none">
+        <button
+          type="button"
+          onClick={() => setMapTheme(mapTheme === 'light' ? 'dark' : 'light')}
+          className="pointer-events-auto min-h-[40px] min-w-[40px] bg-white/95 backdrop-blur-md p-3 rounded-2xl text-slate-900 shadow-xl border border-slate-200 active:scale-95 transition-all"
+        >
+          {mapTheme === 'light' ? <Moon className="w-4 h-4" /> : <Sun className="w-4 h-4" />}
+        </button>
+        <button
+          type="button"
+          onClick={fitAll}
+          className="pointer-events-auto min-h-[40px] min-w-[40px] bg-white/95 p-3 rounded-2xl text-slate-900 shadow-xl border border-slate-200 active:scale-95 transition-all"
+        >
+          <Target className="w-4 h-4" />
+        </button>
+        {nextStop && (
+          <button
+            type="button"
+            title="Ir al siguiente destino"
+            onClick={() => {
+              setSelectedOrder({ ...nextStop, stopNumber: 1 });
+              setSelectedDriver(null);
+              if (leafletMapRef.current) {
+                leafletMapRef.current.setView([nextStop.lat, nextStop.lng], 16, { animate: true });
+              }
+            }}
+            className="pointer-events-auto min-h-[40px] min-w-[40px] bg-emerald-600 hover:bg-emerald-700 text-white p-3 rounded-2xl shadow-xl shadow-emerald-600/30 flex items-center justify-center border border-emerald-500 active:scale-95 transition-all"
+          >
+            <Navigation className="w-4 h-4" fill="currentColor" />
+          </button>
+        )}
       </div>
 
-      <div className={`absolute inset-x-4 z-10 flex flex-col gap-4 pointer-events-none ${isMobile ? 'bottom-[max(6.5rem,env(safe-area-inset-bottom))]' : 'bottom-[max(1rem,env(safe-area-inset-bottom))]'}`}>
-        <div className="pointer-events-auto touch-manipulation bg-white/95 backdrop-blur-md rounded-[2.5rem] shadow-2xl p-4 sm:p-5 border border-slate-200 flex flex-col gap-3 max-h-[28vh] overflow-y-auto overscroll-contain">
+      {/* Footer Info Lote (Elevado para dejar visible la barra de navegación Turno/Mapa/Pedidos) */}
+      <div className="absolute inset-x-3 bottom-24 sm:bottom-28 lg:bottom-6 z-20 flex flex-col gap-4 pointer-events-none">
+        <div className="pointer-events-auto bg-white/95 backdrop-blur-md rounded-2xl shadow-2xl p-3 sm:p-4 border border-slate-200 flex flex-col gap-2 max-h-[24vh] overflow-y-auto">
           <div className="flex items-center justify-between gap-2">
-            <div className="flex items-center gap-3 min-w-0">
-              <div className="bg-emerald-500/10 p-3 rounded-2xl text-emerald-600 shrink-0"><Box className="w-6 h-6" /></div>
+            <div className="flex items-center gap-2.5 min-w-0">
+              <div className="bg-emerald-500/10 p-2 rounded-xl text-emerald-600 shrink-0">
+                <Box className="w-5 h-5" />
+              </div>
               <div className="min-w-0">
-                <p className="text-sm font-black text-slate-900 leading-none truncate">Lote #{currentBatchId || 'Asignado'}</p>
-                <p className="text-[10px] text-slate-500 font-bold uppercase tracking-tight">{displayedStops.length} envíos activos</p>
+                <p className="text-xs sm:text-sm font-black text-slate-900 leading-none truncate">
+                  Lote #{currentBatchId || 'Flota en Vivo'}
+                </p>
+                <p className="text-[9px] sm:text-[10px] text-slate-500 font-bold uppercase tracking-tight mt-0.5">
+                  {displayedStops.length} envíos activos • {Object.keys(fleetDrivers).length} carros monitoreados
+                </p>
               </div>
             </div>
-            {currentBatchId && (
-              <div className="bg-slate-100 p-1 rounded-xl flex gap-1 border border-slate-200 shrink-0">
-                <button type="button" onClick={() => updateRouteStrategy('EFFICIENCY')} className={`min-h-[40px] px-3 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-colors ${optMode === 'EFFICIENCY' ? 'bg-slate-900 text-white shadow-md' : 'text-slate-400'}`}>Eficiencia</button>
-                <button type="button" onClick={() => updateRouteStrategy('PRIORITY')} className={`min-h-[40px] px-3 py-2 rounded-lg text-[10px] font-black uppercase tracking-widest transition-colors ${optMode === 'PRIORITY' ? 'bg-emerald-500 text-white shadow-md' : 'text-slate-400'}`}>Prioridad</button>
-              </div>
-            )}
+            <div className="text-right shrink-0">
+              <span className={`inline-flex items-center px-2 py-0.5 rounded-full text-[9px] font-black uppercase tracking-wider ${
+                optMode === 'EFFICIENCY' ? 'bg-slate-100 text-slate-800' : 'bg-emerald-100 text-emerald-800'
+              }`}>
+                {optMode === 'EFFICIENCY' ? 'Vecino Cercano' : 'Prioridad'}
+              </span>
+            </div>
           </div>
-          {optimizing && (
-            <div className="flex items-center justify-center gap-2 py-1">
-              <Loader2 className="w-4 h-4 text-emerald-500 animate-spin" />
-              <span className="text-[10px] font-black text-emerald-600 uppercase tracking-widest">IA recalculando ruta...</span>
-            </div>
-          )}
         </div>
-
       </div>
     </div>
   );

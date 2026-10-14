@@ -27,7 +27,9 @@ import { LogisticsDispatchCenter } from '../../features/dispatch/LogisticsDispat
 import { BatchConsolidationModule } from '../../features/dispatch/BatchConsolidationModule';
 import { UserManagementModule } from '../../features/users/UserManagementModule';
 
-type AdminTab = 'dashboard' | 'orders' | 'live' | 'analytics' | 'import' | 'reports' | 'dispatch' | 'batchConsolidation' | 'users';
+import { MapsNavigationModule } from '../../features/routes/MapsNavigationModule';
+
+type AdminTab = 'dashboard' | 'map' | 'orders' | 'live' | 'analytics' | 'import' | 'reports' | 'dispatch' | 'batchConsolidation' | 'users';
 
 export const AdminDashboardPage: React.FC = () => {
   const { user, logout } = useAuthStore();
@@ -52,6 +54,7 @@ export const AdminDashboardPage: React.FC = () => {
 
   const navItems = [
     { id: 'dashboard', label: 'Monitor de Flota', icon: LayoutDashboard },
+    { id: 'map', label: 'Mapa en Vivo', icon: Map },
     ...(isLogistica ? [
       { id: 'orders', label: 'Ver Pedidos', icon: Database },
       { id: 'batchConsolidation', label: 'Consolidar Lotes', icon: Plus },
@@ -107,14 +110,14 @@ export const AdminDashboardPage: React.FC = () => {
 
         <div className="mt-auto p-8 border-t border-white/5">
            <div className="flex items-center gap-4 mb-6">
-              <div className="w-10 h-10 rounded-full border-2 border-emerald-400 p-0.5">
-                 <img src={`https://ui-avatars.com/api/?name=${user?.name}&background=10b981&color=fff`} className="rounded-full" alt="User" />
+              <div className="w-10 h-10 rounded-2xl bg-gradient-to-br from-emerald-400 to-teal-600 flex items-center justify-center font-black text-slate-900 shadow-md">
+                 {(user?.name || 'U').charAt(0).toUpperCase()}
               </div>
               <div>
                  <p className="text-[10px] font-black uppercase tracking-widest text-emerald-400">
                     {user?.role === 'ADMIN' ? 'Control Central' : `Operador ${user?.assignedCity || 'Logística'}`}
                  </p>
-                 <p className="text-xs font-bold text-white max-w-[160px] leading-snug">{user?.name}</p>
+                 <p className="text-xs font-bold text-white max-w-[160px] leading-snug truncate">{user?.name || 'Usuario'}</p>
               </div>
            </div>
            <button onClick={handleLogout} className="w-full flex items-center justify-center gap-3 px-6 py-4 bg-white/5 hover:bg-rose-500/10 hover:text-rose-400 rounded-xl text-[10px] font-black uppercase tracking-widest transition-all">
@@ -192,6 +195,12 @@ export const AdminDashboardPage: React.FC = () => {
              transition={{ duration: 0.3 }}
            >
               {activeTab === 'dashboard' && <FleetManagementHome city={selectedCity} onCityChange={setSelectedCity} searchQuery={searchQuery} />}
+
+              {activeTab === 'map' && (
+                <div className="h-[calc(100vh-140px)] w-full rounded-[2.5rem] overflow-hidden shadow-2xl border border-slate-200">
+                   <MapsNavigationModule />
+                </div>
+              )}
 
               {activeTab === 'orders' && (
                 <div className="bg-white p-10 rounded-[2.5rem] border border-slate-100 shadow-sm">

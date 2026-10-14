@@ -1,9 +1,9 @@
-import type { LucideProps } from 'lucide-react';
+import React from 'react';
 import { Eye, EyeOff } from 'lucide-react';
 
 const DEFAULT_SIZE = 20;
 
-type PasswordVisibilityIconProps = Omit<LucideProps, 'ref'>;
+type PasswordVisibilityIconProps = React.SVGProps<SVGSVGElement> & { size?: number | string };
 
 /** Contraseña oculta: pulsar para mostrar */
 export const IconPasswordHidden = ({
