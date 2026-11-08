@@ -31,6 +31,11 @@ interface Driver {
 import { SmartDispatchModal } from './SmartDispatchModal';
 import { useWebSocket } from '../../infrastructure/websocket/useWebSocket';
 import { AssignmentToast } from '../../ui/components/AssignmentToast';
+import { RouteDetailView } from '../routes/components/RouteDetailView';
+import { TransmitToWatchButton } from '../routes/components/TransmitToWatchButton';
+import { useDispatcherWebSocket } from '../routes/hooks/useDispatcherWebSocket';
+import { DeliveryToastContainer, ToastItem } from '../../ui/components/DeliveryEventToast';
+import { Watch, Eye, Route as RouteIcon } from 'lucide-react';
 
 export const LogisticsDispatchCenter: React.FC<{ city?: string; searchQuery?: string }> = ({ city, searchQuery = '' }) => {
   const [batches, setBatches] = useState<Batch[]>([]);
@@ -41,7 +46,30 @@ export const LogisticsDispatchCenter: React.FC<{ city?: string; searchQuery?: st
   const [assigning, setAssigning] = useState(false);
   const [toastOpen, setToastOpen] = useState(false);
   const [toastMessage, setToastMessage] = useState('');
+  const [inspectingRouteId, setInspectingRouteId] = useState<number | null>(null);
+  const [deliveryToasts, setDeliveryToasts] = useState<ToastItem[]>([]);
   const handleCloseToast = useCallback(() => setToastOpen(false), []);
+
+  const handleDeliveryEvent = useCallback((event: any) => {
+    setDeliveryToasts((prev) => [
+      {
+        id: `${Date.now()}-${Math.random()}`,
+        event,
+        receivedAt: new Date(),
+      },
+      ...prev.slice(0, 4),
+    ]);
+  }, []);
+
+  const handleDismissDeliveryToast = useCallback((id: string) => {
+    setDeliveryToasts((prev) => prev.filter((t) => t.id !== id));
+  }, []);
+
+  // Escuchar eventos en tiempo real de telemetría emitidos por Smartwatch Wear OS
+  useDispatcherWebSocket({
+    enabled: inspectingRouteId === null,
+    onDeliveryEvent: handleDeliveryEvent,
+  });
 
   const fetchData = async () => {
     try {
@@ -111,6 +139,18 @@ export const LogisticsDispatchCenter: React.FC<{ city?: string; searchQuery?: st
     }
   };
 
+  if (inspectingRouteId !== null) {
+    const matchingBatch = batches.find((b) => b.id === inspectingRouteId);
+    return (
+      <RouteDetailView
+        routeId={inspectingRouteId}
+        initialDriverId={matchingBatch?.driver?.id}
+        initialDriverName={matchingBatch?.driver?.name}
+        onBack={() => setInspectingRouteId(null)}
+      />
+    );
+  }
+
   return (
     <div className="space-y-10">
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-10">
@@ -151,7 +191,21 @@ export const LogisticsDispatchCenter: React.FC<{ city?: string; searchQuery?: st
                             </p>
                          </div>
                       </div>
-                      <ChevronRight className={selectedBatch?.id === batch.id ? 'text-teal-500' : 'text-slate-200'} />
+                      <div className="flex items-center gap-3">
+                         <button
+                           type="button"
+                           onClick={(e) => {
+                             e.stopPropagation();
+                             setInspectingRouteId(batch.id);
+                           }}
+                           className="px-3 py-1.5 rounded-xl bg-slate-100 hover:bg-teal-50 text-slate-600 hover:text-teal-700 transition-colors flex items-center gap-1.5 text-[10px] font-black uppercase tracking-wider"
+                           title="Inspeccionar Ruta y Telemetría Wear OS"
+                         >
+                           <Watch size={13} className="text-teal-600" />
+                           <span>Wear OS</span>
+                         </button>
+                         <ChevronRight className={selectedBatch?.id === batch.id ? 'text-teal-500' : 'text-slate-200'} />
+                      </div>
                    </div>
                 </motion.div>
               ))}
@@ -198,7 +252,18 @@ export const LogisticsDispatchCenter: React.FC<{ city?: string; searchQuery?: st
                             </button>
                           ))}
                        </div>
-                       <button onClick={() => setSelectedBatch(null)} className="w-full py-4 text-[9px] font-black uppercase text-slate-500">Cancelar Asignación</button>
+                       <div className="pt-2 space-y-2">
+                          <button
+                            type="button"
+                            onClick={() => setInspectingRouteId(selectedBatch.id)}
+                            className="w-full flex items-center justify-center gap-2 py-3 bg-teal-500/10 hover:bg-teal-500/20 text-teal-400 rounded-2xl text-xs font-black uppercase tracking-wider transition-colors border border-teal-500/20"
+                          >
+                            <RouteIcon size={14} /> Inspeccionar Ruta & Telemetría
+                          </button>
+                          <button onClick={() => setSelectedBatch(null)} className="w-full py-2 text-[9px] font-black uppercase text-slate-500 hover:text-slate-300">
+                            Cancelar Asignación
+                          </button>
+                       </div>
                     </motion.div>
                  ) : (
                     <motion.div initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="text-center py-10">
@@ -244,6 +309,11 @@ export const LogisticsDispatchCenter: React.FC<{ city?: string; searchQuery?: st
         isOpen={toastOpen}
         message={toastMessage}
         onClose={handleCloseToast}
+      />
+
+      <DeliveryToastContainer
+        toasts={deliveryToasts}
+        onDismiss={handleDismissDeliveryToast}
       />
     </div>
   );
