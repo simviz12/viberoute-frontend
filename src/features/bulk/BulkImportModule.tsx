@@ -42,8 +42,8 @@ export const BulkImportModule: React.FC<{ onComplete?: () => void }> = ({ onComp
         // Mapeo defensivo para asegurar compatibilidad con el DTO del backend
         const mappedData = rawList.map((item: any) => ({
           ...item,
-          // Ignorar lat/lng artificiales del JSON para forzar geocodificación real en el backend
-          location: undefined,
+          // Preservar coordenadas si el JSON las incluye, o undefined para geocodificar en backend
+          location: (item.location && item.location.lat && item.location.lng) ? item.location : undefined,
           // Mapear NORMAL a MEDIUM (compatibilidad de enums)
           priority: item.priority === 'NORMAL' ? 'MEDIUM' : item.priority || 'MEDIUM'
         }));

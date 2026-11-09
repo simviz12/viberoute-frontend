@@ -26,6 +26,7 @@ import api from '../../shared/lib/api';
 import { OrdersManagementModule } from '../../features/orders/OrdersManagementModule';
 import { MapsNavigationModule } from '../../features/routes/MapsNavigationModule';
 import { useRouteStore } from '../../app/store/routeStore';
+import { useWebSocket } from '../../infrastructure/websocket/useWebSocket';
 
 type DriverView = 'summary' | 'map' | 'list';
 
@@ -122,6 +123,18 @@ export const DriverDashboardPage: React.FC = () => {
     }
     fetchData();
   }, [token, user?.email]);
+
+  const apiBase = import.meta.env.VITE_API_URL || 'http://localhost:8080/api/v1';
+  const WS_URL = `${apiBase.replace('/api/v1', '')}/ws-alertas`;
+
+  // Sincronización instantánea con el Smartwatch (Wear OS) vía WebSockets
+  useWebSocket({
+    url: WS_URL,
+    topic: '/topic/wearable/deliveries',
+    onMessage: () => {
+       fetchData({ preserveMission: true });
+    }
+  });
 
   const handleLogout = useCallback(() => {
     const confirmLogout = window.confirm(
